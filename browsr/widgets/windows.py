@@ -5,6 +5,7 @@ Content Windows
 from __future__ import annotations
 
 import contextlib
+from enum import Enum
 from json import JSONDecodeError
 from typing import Any, ClassVar, NamedTuple
 
@@ -13,8 +14,10 @@ import pandas as pd
 import pyperclip
 from art import text2art
 from numpy import nan
+from rich.console import RenderableType
 from rich.markdown import Markdown
 from rich.syntax import Syntax
+from rich.text import Text
 from rich_pixels import Pixels
 from textual.app import ComposeResult
 from textual.binding import Binding
@@ -47,6 +50,33 @@ from browsr.widgets.vim import VimDataTable, VimScroll
 class FileToStringResult(NamedTuple):
     result: str
     error_occurred: bool
+    error: Exception | None = None
+
+
+class RenderTarget(Enum):
+    """
+    The content window a prepared file should be rendered into.
+    """
+
+    STATIC = "static"
+    TEXT = "text"
+    DATATABLE = "datatable"
+
+
+class FileRenderPayload(NamedTuple):
+    """
+    The result of preparing a file off of the UI thread.
+
+    ``commit_file`` applies the payload to the widgets on the UI thread.
+    """
+
+    file_path: UPath
+    file_info: FileInfo | None
+    target: RenderTarget
+    data: Any
+    scroll_home: bool = True
+    is_error: bool = False
+    error: Exception | None = None
 
 
 class ThemeVisibleMixin:
@@ -91,17 +121,24 @@ class BaseCodeWindow(Widget):
         Returns a tuple of the string and a boolean indicating if an exception occurred.
         """
         error_occurred = False
+        error: Exception | None = None
         try:
             if file_path.suffix in self.archive_extensions:
                 message = f"Cannot render archive file {file_path}."
                 raise ArchiveFileError(message)
             text = file_path.read_text(encoding="utf-8")
         except Exception as e:
-            text = self.handle_exception(exception=e)
+            error_message = self.handle_exception(exception=e)
+            if error_message is None:
+                error_message = f"Unable to read {file_path}:\n{e}"
+            text = error_message
             error_occurred = True
+            error = e
         if max_lines:
             text = "\n".join(text.split("\n")[:max_lines])
-        return FileToStringResult(result=text, error_occurred=error_occurred)
+        return FileToStringResult(
+            result=text, error_occurred=error_occurred, error=error
+        )
 
     def file_to_image(self, file_path: UPath) -> Pixels:
         """
@@ -113,15 +150,20 @@ class BaseCodeWindow(Widget):
 
     def file_to_json(self, file_path: UPath, max_lines: int | None = None) -> str:
         """
-        Load a file into a JSON object
+        Load a file into a JSON object.
+
+        Raises the underlying read exception when the file cannot be read.
         """
-        code_str = self.file_to_string(file_path=file_path).result
+        result = self.file_to_string(file_path=file_path)
+        if result.error_occurred and result.error is not None:
+            raise result.error
+        code_str = result.result
         try:
             code_obj = orjson.loads(code_str)
             code_str = orjson.dumps(code_obj, option=orjson.OPT_INDENT_2).decode(
                 "utf-8"
             )
-        except JSONDecodeError:
+        except (JSONDecodeError, orjson.JSONDecodeError):
             pass
         if max_lines:
             code_str = "\n".join(code_str.split("\n")[:max_lines])
@@ -138,9 +180,12 @@ class BaseCodeWindow(Widget):
             raise FileSizeError("File too large")
 
     @classmethod
-    def handle_exception(cls, exception: Exception) -> str:
+    def handle_exception(cls, exception: Exception) -> str | None:
         """
-        Handle an exception
+        Handle an exception.
+
+        Returns ASCII art for known, renderable errors and ``None`` for
+        anything the caller should describe itself.
         """
         font = "univers"
         exception_map = {
@@ -153,7 +198,7 @@ class BaseCodeWindow(Widget):
         for exc_type, (line1, line2) in exception_map.items():
             if isinstance(exception, exc_type):
                 return text2art(line1, font=font) + "\n\n" + text2art(line2, font=font)
-        raise exception from exception
+        return None
 
 
 class StaticWindow(Static, BaseCodeWindow, ThemeVisibleMixin, LinenosVisibleMixin):
@@ -173,10 +218,15 @@ class StaticWindow(Static, BaseCodeWindow, ThemeVisibleMixin, LinenosVisibleMixi
         self, file_path: UPath, max_lines: int | None = None
     ) -> Markdown:
         """
-        Load a file into a Markdown
+        Load a file into a Markdown.
+
+        Raises the underlying read exception when the file cannot be read.
         """
+        result = self.file_to_string(file_path, max_lines=max_lines)
+        if result.error_occurred and result.error is not None:
+            raise result.error
         return Markdown(
-            self.file_to_string(file_path, max_lines=max_lines).result,
+            result.result,
             code_theme=self.theme,
             hyperlinks=True,
         )
@@ -314,19 +364,29 @@ class DataTableWindow(VimDataTable, BaseCodeWindow):
     A DataTable widget for displaying code.
     """
 
+    def load_dataframe(
+        self, file_path: UPath, max_lines: int | None = None
+    ) -> pd.DataFrame:
+        """
+        Read a file into a pandas DataFrame.
+
+        This performs blocking IO and is safe to call off of the UI thread.
+        """
+        if ".csv" in file_path.suffixes:
+            return pd.read_csv(file_path, nrows=max_lines)
+        elif file_path.suffix.lower() in [".parquet"]:
+            return pd.read_parquet(file_path).head(max_lines)
+        elif file_path.suffix.lower() in [".feather", ".fea"]:
+            return pd.read_feather(file_path).head(max_lines)
+        else:
+            msg = f"Cannot render file as a DataTable, {file_path}."
+            raise NotImplementedError(msg)
+
     def refresh_from_file(self, file_path: UPath, max_lines: int | None = None) -> None:
         """
         Load a file into a DataTable
         """
-        if ".csv" in file_path.suffixes:
-            df = pd.read_csv(file_path, nrows=max_lines)
-        elif file_path.suffix.lower() in [".parquet"]:
-            df = pd.read_parquet(file_path).head(max_lines)
-        elif file_path.suffix.lower() in [".feather", ".fea"]:
-            df = pd.read_feather(file_path).head(max_lines)
-        else:
-            msg = f"Cannot render file as a DataTable, {file_path}."
-            raise NotImplementedError(msg)
+        df = self.load_dataframe(file_path=file_path, max_lines=max_lines)
         self.refresh_from_df(df)
 
     def refresh_from_df(
@@ -470,85 +530,172 @@ class WindowSwitcher(Container, ThemeVisibleMixin, LinenosVisibleMixin):
             container_widget.display = window is window_widget
         self._update_subtitle()
 
-    def render_file(self, file_path: UPath, scroll_home: bool = True) -> None:
+    def render_file(
+        self, file_path: UPath, scroll_home: bool = True
+    ) -> FileRenderPayload:
         """
-        Render a file
+        Render a file synchronously.
+
+        Prefer :meth:`prepare_file` + :meth:`commit_file` when rendering
+        from the UI thread so that the blocking IO happens on a worker.
+        """
+        payload = self.prepare_file(file_path=file_path, scroll_home=scroll_home)
+        self.commit_file(payload)
+        return payload
+
+    def prepare_file(
+        self, file_path: UPath, scroll_home: bool = True
+    ) -> FileRenderPayload:
+        """
+        Stat and read a file, returning a payload that can be committed later.
+
+        This performs all blocking IO and must not touch the widgets, so it
+        is safe to call on a worker thread.
         """
         try:
             file_info = get_file_info(file_path=file_path)
+        except Exception as stat_exception:
+            return self._error_payload(
+                file_path=file_path,
+                exception=stat_exception,
+                file_info=None,
+                scroll_home=scroll_home,
+            )
+        try:
             self.static_window.handle_file_size(
                 file_info=file_info, max_file_size=self.config_object.max_file_size
             )
             joined_suffixes = "".join(file_path.suffixes).lower()
             if joined_suffixes in self.datatable_extensions:
-                switch_window = self._render_datatable(file_path)
+                target = RenderTarget.DATATABLE
+                data = self._load_datatable(file_path)
             elif file_path.suffix.lower() in self.image_extensions:
-                switch_window = self._render_image(file_path)
+                target = RenderTarget.STATIC
+                data = self._load_image(file_path)
             elif file_path.suffix.lower() in self.markdown_extensions:
-                switch_window = self._render_markdown(file_path)
+                target = RenderTarget.STATIC
+                data = self._load_markdown(file_path)
             elif file_path.suffix.lower() in self.json_extensions:
-                switch_window = self._render_json(file_path)
+                target = RenderTarget.TEXT
+                data = self._load_json(file_path)
             else:
-                switch_window = self._render_text(file_path)
-        except Exception as e:
-            error_message = self.static_window.handle_exception(exception=e)
-            error_syntax = self.static_window.text_to_syntax(
-                text=error_message,
+                target = RenderTarget.TEXT
+                data = self._load_text(file_path)
+        except Exception as exception:
+            return self._error_payload(
                 file_path=file_path,
+                exception=exception,
+                file_info=file_info,
+                scroll_home=scroll_home,
             )
-            self.static_window.update(error_syntax)
-            switch_window = self.static_window
+        return FileRenderPayload(
+            file_path=file_path,
+            file_info=file_info,
+            target=target,
+            data=data,
+            scroll_home=scroll_home,
+        )
 
-        self.switch_window(switch_window)
+    def commit_file(self, payload: FileRenderPayload) -> None:
+        """
+        Apply a prepared file payload to the widgets on the UI thread.
+        """
+        if payload.target is RenderTarget.DATATABLE:
+            self.datatable_window.refresh_from_df(payload.data)
+            target_window: BaseCodeWindow = self.datatable_window
+        elif payload.target is RenderTarget.TEXT:
+            self.text_window.load_file(payload.data, payload.file_path)
+            target_window = self.text_window
+        else:
+            self.static_window.update(payload.data)
+            target_window = self.static_window
+
+        self.switch_window(target_window)
         active_widget = self.get_active_widget()
-        if scroll_home:
+        if payload.scroll_home:
             if active_widget is self.vim_scroll:
                 self.vim_scroll.scroll_home(animate=False)
             else:
-                switch_window.scroll_home(animate=False)
-        self.rendered_file = file_path
+                target_window.scroll_home(animate=False)
+        self.rendered_file = payload.file_path
         self._update_subtitle()
 
-    def _render_datatable(self, file_path: UPath) -> BaseCodeWindow:
-        """Render a datatable file"""
-        self.datatable_window.refresh_from_file(
+    def _error_payload(
+        self,
+        file_path: UPath,
+        exception: Exception,
+        file_info: FileInfo | None,
+        scroll_home: bool,
+    ) -> FileRenderPayload:
+        """
+        Build a recoverable error payload for a failed file preparation.
+        """
+        error_renderable = self._build_error_renderable(
+            file_path=file_path, exception=exception
+        )
+        return FileRenderPayload(
+            file_path=file_path,
+            file_info=file_info,
+            target=RenderTarget.STATIC,
+            data=error_renderable,
+            scroll_home=scroll_home,
+            is_error=True,
+            error=exception,
+        )
+
+    @staticmethod
+    def _build_error_renderable(
+        file_path: UPath, exception: Exception
+    ) -> RenderableType:
+        """
+        Build a renderable describing a recoverable file read error.
+        """
+        art = StaticWindow.handle_exception(exception)
+        error_text = Text(
+            art or "UNABLE TO READ FILE",
+            style="bold red",
+        )
+        error_text.append(f"\n\n{file_path}", style="red")
+        error_text.append(
+            f"\n{type(exception).__name__}: {exception}",
+            style="red",
+        )
+        error_text.append(
+            "\n\nPress r to reload, or select the file again.",
+            style="yellow",
+        )
+        return error_text
+
+    def _load_datatable(self, file_path: UPath) -> pd.DataFrame:
+        """Load a datatable file off of the UI thread."""
+        return self.datatable_window.load_dataframe(
             file_path=file_path, max_lines=self.config_object.max_lines
         )
-        return self.datatable_window
 
-    def _render_image(self, file_path: UPath) -> BaseCodeWindow:
-        """Render an image file"""
-        image = self.static_window.file_to_image(file_path=file_path)
-        self.static_window.update(image)
-        return self.static_window
+    def _load_image(self, file_path: UPath) -> Pixels:
+        """Load an image file off of the UI thread."""
+        return self.static_window.file_to_image(file_path=file_path)
 
-    def _render_markdown(self, file_path: UPath) -> BaseCodeWindow:
-        """Render a markdown file"""
-        markdown = self.static_window.file_to_markdown(
+    def _load_markdown(self, file_path: UPath) -> Markdown:
+        """Load a markdown file off of the UI thread."""
+        return self.static_window.file_to_markdown(
             file_path=file_path, max_lines=self.config_object.max_lines
         )
-        self.static_window.update(markdown)
-        return self.static_window
 
-    def _render_json(self, file_path: UPath) -> BaseCodeWindow:
-        """Render a JSON file"""
-        json_str = self.static_window.file_to_json(
+    def _load_json(self, file_path: UPath) -> str:
+        """Load a JSON file off of the UI thread."""
+        return self.static_window.file_to_json(
             file_path=file_path, max_lines=self.config_object.max_lines
         )
-        self.text_window.load_file(json_str, file_path)
-        return self.text_window
 
-    def _render_text(self, file_path: UPath) -> BaseCodeWindow:
-        """Render a text file"""
+    def _load_text(self, file_path: UPath) -> str:
+        """Load a text file off of the UI thread."""
         result = self.static_window.file_to_string(
             file_path=file_path, max_lines=self.config_object.max_lines
         )
-        if result.error_occurred:
-            self.static_window.update(result.result)
-            return self.static_window
-        else:
-            self.text_window.load_file(result.result, file_path)
-            return self.text_window
+        if result.error_occurred and result.error is not None:
+            raise result.error
+        return result.result
 
     def next_theme(self) -> str | None:
         """

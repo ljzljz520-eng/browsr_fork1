@@ -14,6 +14,7 @@ from textual.containers import Horizontal
 from textual.events import Mount
 from textual.widget import Widget
 from textual.widgets import Footer, Header
+from textual.worker import WorkerCancelled
 from textual_universal_directorytree import UPath
 
 from browsr.base import SortedBindingsScreen, TextualAppContext
@@ -86,11 +87,9 @@ class CodeBrowserScreen(SortedBindingsScreen):
             self.file_information,
             id="file-info-bar",
         )
-        if self.code_browser.selected_file_path is not None:
-            self.file_information.file_info = get_file_info(
-                file_path=self.code_browser.selected_file_path
-            )
-        else:
+        if self.code_browser.selected_file_path is None:
+            # The selected file's FileInfo arrives with its generation commit,
+            # so only pre-populate the bar when no file preview is pending.
             self.file_information.file_info = get_file_info(self.config_object.path)
         self.footer = Footer()
 
@@ -104,25 +103,24 @@ class CodeBrowserScreen(SortedBindingsScreen):
         yield self.footer
 
     @on(Mount)
-    def start_up_app(self) -> None:
+    async def start_up_app(self) -> None:
         """
         On Application Mount - See If a File Should be Displayed
         """
         if self.code_browser.selected_file_path is not None:
             self.code_browser.show_tree = self.code_browser.force_show_tree
-            self.code_browser.window_switcher.render_file(
-                file_path=self.code_browser.selected_file_path
+            worker = self.code_browser.render_selected_file(
+                file_path=self.code_browser.selected_file_path,
+                focus_when_ready=self.code_browser.show_tree is False,
             )
-            if (
-                self.code_browser.show_tree is False
-                and self.code_browser.static_window.display is True
-            ):
-                self.code_browser.window_switcher.focus()
-            elif (
-                self.code_browser.show_tree is False
-                and self.code_browser.datatable_window.display is True
-            ):
-                self.code_browser.datatable_window.focus()
+            # Awaiting the worker yields to the event loop, so the app stays
+            # responsive while the (potentially remote) preview is loading.
+            try:
+                await worker.wait()
+            except WorkerCancelled:
+                # A tree selection superseded the startup render: let that
+                # generation handle content focus when it commits.
+                self.code_browser.request_content_focus()
         else:
             self.code_browser.show_tree = True
 
@@ -192,7 +190,7 @@ class CodeBrowserScreen(SortedBindingsScreen):
         if reload_file:
             selected_file_path = cast(UPath, self.code_browser.selected_file_path)
             file_name = selected_file_path.name
-            self.code_browser.window_switcher.render_file(
+            self.code_browser.render_selected_file(
                 file_path=selected_file_path,
                 scroll_home=False,
             )

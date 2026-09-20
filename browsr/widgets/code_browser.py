@@ -17,6 +17,7 @@ from textual.events import Mount
 from textual.reactive import var
 from textual.widget import Widget
 from textual.widgets import DirectoryTree
+from textual.worker import Worker, get_current_worker
 from textual_universal_directorytree import (
     UPath,
     is_remote_path,
@@ -27,7 +28,6 @@ from browsr.base import (
 )
 from browsr.config import favorite_themes
 from browsr.utils import (
-    get_file_info,
     handle_duplicate_filenames,
 )
 from browsr.widgets.base import BaseOverlay, BasePopUp
@@ -36,7 +36,12 @@ from browsr.widgets.double_click_directory_tree import DoubleClickDirectoryTree
 from browsr.widgets.files import CurrentFileInfoBar
 from browsr.widgets.shortcuts import ShortcutsPopUp, ShortcutsWindow
 from browsr.widgets.universal_directory_tree import BrowsrDirectoryTree
-from browsr.widgets.windows import DataTableWindow, StaticWindow, WindowSwitcher
+from browsr.widgets.windows import (
+    DataTableWindow,
+    FileRenderPayload,
+    StaticWindow,
+    WindowSwitcher,
+)
 
 
 class CodeBrowser(Container):
@@ -95,6 +100,15 @@ class CodeBrowser(Container):
         )
         self.shortcuts_window.display = False
         self._content_display_state: dict[Widget, bool] = {}
+        # File preview generation tracking. Every new selection / reload /
+        # startup preview bumps the generation. Only the latest generation is
+        # allowed to commit content, FileInfo or the subtitle.
+        self._render_generation: int = 0
+        self._committed_generation: int = -1
+        self._render_worker: Worker[FileRenderPayload] | None = None
+        # Generation whose commit should (re)focus the content window, used to
+        # defer focus restoration when an overlay closes mid-render.
+        self._pending_focus_generation: int | None = None
         self._overlay_history: list[BaseOverlay] = []
         self._overlay_popup_map: dict[BaseOverlay, BasePopUp] = {
             self.confirmation_window: self.confirmation,
@@ -221,6 +235,11 @@ class CodeBrowser(Container):
         """
         for widget, state in self._content_display_state.items():
             widget.display = state
+        if self._committed_generation != self._render_generation:
+            # A newer file render is still in flight: focusing now would focus
+            # the stale window. The matching commit will move focus for us.
+            self._pending_focus_generation = self._render_generation
+            return
         active_widget = self.window_switcher.get_active_widget()
         if active_widget is not None:
             active_widget.focus()
@@ -279,9 +298,123 @@ class CodeBrowser(Container):
         Called when the user click a file in the directory tree.
         """
         self.selected_file_path = message.path  # type: ignore[assignment]
-        file_info = get_file_info(file_path=self.selected_file_path)  # type: ignore[arg-type]
-        self.window_switcher.render_file(file_path=self.selected_file_path)  # type: ignore[arg-type]
-        self.post_message(CurrentFileInfoBar.FileInfoUpdate(new_file=file_info))
+        self.render_selected_file(file_path=message.path)  # type: ignore[arg-type]
+
+    def render_selected_file(
+        self,
+        file_path: UPath | None = None,
+        *,
+        scroll_home: bool = True,
+        focus_when_ready: bool = False,
+    ) -> Worker[FileRenderPayload]:
+        """
+        Render a file on a worker thread without blocking the UI.
+
+        Each call starts a new *generation* and cancels the previous worker.
+        Workers may keep running on blocked remote IO, but only the latest
+        generation is allowed to commit results to the widgets.
+        """
+        if file_path is None:
+            file_path = self.selected_file_path
+        if file_path is None:
+            msg = "No file is selected to render"
+            raise ValueError(msg)
+        self.selected_file_path = file_path
+        self._render_generation += 1
+        generation = self._render_generation
+        worker = self._render_file_worker(
+            file_path=file_path,
+            generation=generation,
+            scroll_home=scroll_home,
+            focus_when_ready=focus_when_ready,
+        )
+        self._render_worker = worker
+        return worker
+
+    def request_content_focus(self) -> None:
+        """
+        Focus the active content window now, or once the pending render commits.
+        """
+        if (
+            self._committed_generation == self._render_generation
+            and self._get_active_overlay() is None
+        ):
+            active_widget = self.window_switcher.get_active_widget()
+            if active_widget is not None:
+                active_widget.focus()
+                return
+        self._pending_focus_generation = self._render_generation
+
+    @work(thread=True, group="file-preview", exclusive=True, exit_on_error=False)
+    def _render_file_worker(
+        self,
+        file_path: UPath,
+        generation: int,
+        scroll_home: bool,
+        focus_when_ready: bool,
+    ) -> FileRenderPayload:
+        """
+        Load a file on a worker thread and commit it from the UI thread.
+        """
+        payload = self.window_switcher.prepare_file(
+            file_path=file_path, scroll_home=scroll_home
+        )
+        worker = get_current_worker()
+        # A newer selection may have started while the (uninterruptible)
+        # remote IO was blocked: its generation wins, drop our result.
+        if worker.is_cancelled or generation != self._render_generation:
+            return payload
+        try:
+            self.app.call_from_thread(
+                self._commit_file_render,
+                payload,
+                generation,
+                focus_when_ready,
+            )
+        except RuntimeError:
+            # The event loop has already stopped (app is shutting down):
+            # there is no UI left to write the result to.
+            pass
+        return payload
+
+    def _commit_file_render(
+        self,
+        payload: FileRenderPayload,
+        generation: int,
+        focus_when_ready: bool,
+    ) -> None:
+        """
+        Commit a prepared render from the UI thread.
+
+        Stale generations (older selections) and detached widgets are ignored
+        so late worker results can never overwrite a newer selection.
+        """
+        if not self.is_attached or generation != self._render_generation:
+            return
+        self.window_switcher.commit_file(payload)
+        self._committed_generation = generation
+        if payload.is_error and payload.error is not None:
+            self.notify(
+                title="Unable to Read File",
+                message=(
+                    f"{payload.file_path}\n"
+                    f"{type(payload.error).__name__}: {payload.error}"
+                ),
+                severity="error",
+                timeout=3,
+            )
+        if self._get_active_overlay() is not None:
+            # An overlay is covering the windows. Refresh the captured state
+            # so closing it restores the freshly committed window, and keep
+            # the content physically hidden behind the overlay.
+            self._content_display_state = self._get_content_window_display_state()
+            self._hide_content_windows()
+        elif focus_when_ready or self._pending_focus_generation == generation:
+            self._pending_focus_generation = None
+            active_widget = self.window_switcher.get_active_widget()
+            if active_widget is not None:
+                active_widget.focus()
+        self.post_message(CurrentFileInfoBar.FileInfoUpdate(new_file=payload.file_info))
 
     @on(DoubleClickDirectoryTree.DirectoryDoubleClicked)
     def handle_directory_double_click(
